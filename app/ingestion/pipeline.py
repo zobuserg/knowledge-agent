@@ -1,15 +1,14 @@
 """
 Ingestion Pipeline
 ------------------
-Takes raw documents (PDF, Markdown, TXT) and stores them
-in a ChromaDB vector store, ready for retrieval.
-
-Flow:
-    raw file  →  load  →  chunk  →  embed  →  ChromaDB
+Loads documents into ChromaDB for retrieval.
+Supports: single file, multiple files, full folder sync.
 """
 
 from pathlib import Path
 from typing import Optional
+import hashlib
+import json
 
 import chromadb
 from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, StorageContext
@@ -20,121 +19,48 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 from app.config import settings
 
 
-def get_vector_store(collection_name: Optional[str] = None) -> tuple:
-    """
-    Creates (or reopens) a ChromaDB collection and wraps it
-    in a LlamaIndex VectorStore.
+# ── Vector store ──────────────────────────────────────────────────────────────
 
-    Returns:
-        (chroma_collection, llama_vector_store)
-
-    Why ChromaDB?
-        - Runs locally, no API key needed
-        - Persistent: survives restarts (data stays on disk)
-        - Fast for the scale we need (thousands of chunks)
-    """
+def get_vector_store(collection_name: Optional[str] = None):
     name = collection_name or settings.COLLECTION_NAME
-
-    # PersistentClient = data saved to disk, not lost on restart
     client = chromadb.PersistentClient(path=str(settings.CHROMA_PERSIST_DIR))
-
-    # get_or_create: safe to call multiple times — won't duplicate
     collection = client.get_or_create_collection(name)
-
     vector_store = ChromaVectorStore(chroma_collection=collection)
     return collection, vector_store
 
 
 def get_embed_model():
-    """
-    Returns an embedding model.
-    Uses Ollama locally (free, no API key, runs offline).
-
-    Embeddings = turning text into a vector of numbers
-    so we can find "similar" chunks by measuring distance.
-    """
     return OllamaEmbedding(
         model_name=settings.EMBED_MODEL,
         base_url=settings.OLLAMA_BASE_URL,
     )
 
 
-def ingest_directory(path: str | Path) -> dict:
-    """
-    Main function: load all documents in a folder and index them.
+# ── File tracking (avoid re-indexing unchanged files) ─────────────────────────
 
-    Args:
-        path: folder containing your documents (PDF, MD, TXT)
+SYNC_LOG = settings.CHROMA_PERSIST_DIR / ".sync_log.json"
 
-    Returns:
-        dict with stats: how many docs and chunks were processed
-    """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Directory not found: {path}")
+def load_sync_log() -> dict:
+    """Returns {filepath: md5_hash} of already-indexed files."""
+    if SYNC_LOG.exists():
+        return json.loads(SYNC_LOG.read_text(encoding="utf-8"))
+    return {}
 
-    print(f"[Ingestion] Loading documents from: {path}")
+def save_sync_log(log: dict):
+    SYNC_LOG.parent.mkdir(parents=True, exist_ok=True)
+    SYNC_LOG.write_text(json.dumps(log, indent=2), encoding="utf-8")
 
-    # Step 1: Load — SimpleDirectoryReader handles PDF, MD, TXT automatically
-    documents = SimpleDirectoryReader(
-        input_dir=str(path),
-        recursive=True,           # look inside subfolders too
-        required_exts=[".pdf", ".md", ".txt"],
-    ).load_data()
+def file_hash(path: Path) -> str:
+    """MD5 of file content — detects if a file changed since last sync."""
+    return hashlib.md5(path.read_bytes()).hexdigest()
 
+
+# ── Core indexing ─────────────────────────────────────────────────────────────
+
+def _index_documents(documents, show_progress=True) -> int:
+    """Takes loaded LlamaIndex documents, embeds and stores them. Returns chunk count."""
     if not documents:
-        return {"docs_loaded": 0, "chunks_created": 0}
-
-    print(f"[Ingestion] Loaded {len(documents)} document(s)")
-
-    # Step 2: Chunk — split each doc into overlapping pieces
-    # Why overlap? So a sentence at the edge of a chunk isn't cut in half.
-    # chunk_size=512 tokens is a good default for most content.
-    splitter = SentenceSplitter(
-        chunk_size=settings.CHUNK_SIZE,
-        chunk_overlap=settings.CHUNK_OVERLAP,
-    )
-
-    # Step 3: Get the vector store (ChromaDB)
-    _, vector_store = get_vector_store()
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-    # Step 4: Embed + Store — VectorStoreIndex does both in one call
-    # It: splits docs → creates embeddings → stores in ChromaDB
-    embed_model = get_embed_model()
-
-    index = VectorStoreIndex.from_documents(
-        documents,
-        storage_context=storage_context,
-        embed_model=embed_model,
-        transformations=[splitter],
-        show_progress=True,
-    )
-
-    # Count how many chunks were created
-    collection, _ = get_vector_store()
-    chunk_count = collection.count()
-
-    print(f"[Ingestion] Done. {chunk_count} chunks in vector store.")
-
-    return {
-        "docs_loaded": len(documents),
-        "chunks_created": chunk_count,
-        "collection": settings.COLLECTION_NAME,
-    }
-
-
-def ingest_single_file(file_path: str | Path) -> dict:
-    """
-    Ingest a single file instead of a whole directory.
-    Useful for the API endpoint POST /ingest.
-    """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    # Wrap single file in a temp folder structure LlamaIndex expects
-    documents = SimpleDirectoryReader(input_files=[str(file_path)]).load_data()
+        return 0
 
     _, vector_store = get_vector_store()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
@@ -149,12 +75,111 @@ def ingest_single_file(file_path: str | Path) -> dict:
         storage_context=storage_context,
         embed_model=embed_model,
         transformations=[splitter],
-        show_progress=True,
+        show_progress=show_progress,
     )
 
     collection, _ = get_vector_store()
-    return {
-        "file": file_path.name,
-        "docs_loaded": len(documents),
-        "total_chunks_in_store": collection.count(),
-    }
+    return collection.count()
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def ingest_files(file_paths: list[Path], show_progress=True) -> dict:
+    """
+    Ingest a list of files. Skips files that haven't changed since last sync.
+    Returns stats dict.
+    """
+    SUPPORTED = {".pdf", ".md", ".txt"}
+    sync_log = load_sync_log()
+
+    to_index = []
+    skipped = 0
+    new_files = []
+
+    for path in file_paths:
+        path = Path(path)
+        if not path.exists() or path.suffix.lower() not in SUPPORTED:
+            continue
+        h = file_hash(path)
+        key = str(path)
+        if sync_log.get(key) == h:
+            skipped += 1
+            continue
+        to_index.append(path)
+        new_files.append((key, h))
+
+    if not to_index:
+        collection, _ = get_vector_store()
+        return {"new": 0, "skipped": skipped, "total_chunks": collection.count()}
+
+    documents = SimpleDirectoryReader(input_files=[str(p) for p in to_index]).load_data()
+    total = _index_documents(documents, show_progress=show_progress)
+
+    for key, h in new_files:
+        sync_log[key] = h
+    save_sync_log(sync_log)
+
+    return {"new": len(to_index), "skipped": skipped, "total_chunks": total}
+
+
+def sync_folder(folder_path: str | Path, recursive: bool = True) -> dict:
+    """
+    Sync an entire folder. Only indexes new or changed files.
+    This is the main function for 'connect your knowledge base'.
+    """
+    folder = Path(folder_path)
+    if not folder.exists():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    SUPPORTED = {".pdf", ".md", ".txt"}
+    if recursive:
+        files = [f for f in folder.rglob("*") if f.suffix.lower() in SUPPORTED]
+    else:
+        files = [f for f in folder.iterdir() if f.suffix.lower() in SUPPORTED]
+
+    # Save connected folder to config
+    settings.CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+    folder_config = settings.CHROMA_PERSIST_DIR / ".connected_folder.txt"
+    folder_config.write_text(str(folder), encoding="utf-8")
+
+    return ingest_files(files, show_progress=True)
+
+
+def get_connected_folder() -> Optional[str]:
+    """Returns the last connected folder path, if any."""
+    folder_config = settings.CHROMA_PERSIST_DIR / ".connected_folder.txt"
+    if folder_config.exists():
+        return folder_config.read_text(encoding="utf-8").strip()
+    return None
+
+
+def get_index_stats() -> dict:
+    """Summary of what's currently indexed."""
+    try:
+        collection, _ = get_vector_store()
+        count = collection.count()
+        if count == 0:
+            return {"total_chunks": 0, "documents": [], "connected_folder": get_connected_folder()}
+
+        results = collection.get(include=["metadatas"])
+        files = sorted({
+            m.get("file_name") or Path(m.get("file_path", "unknown")).name
+            for m in results["metadatas"]
+        })
+
+        sync_log = load_sync_log()
+
+        return {
+            "total_chunks": count,
+            "total_documents": len(files),
+            "documents": files,
+            "connected_folder": get_connected_folder(),
+            "indexed_files": len(sync_log),
+        }
+    except Exception:
+        return {"total_chunks": 0, "documents": [], "connected_folder": None}
+
+
+def ingest_single_file(file_path: str | Path) -> dict:
+    """Ingest a single file. Convenience wrapper."""
+    return ingest_files([Path(file_path)])
