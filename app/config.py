@@ -8,15 +8,10 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # API Keys
-    ANTHROPIC_API_KEY: str = ""
-
-    # Ollama (local, free)
+    # Ollama (local, free, no API key needed)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    EMBED_MODEL: str = "nomic-embed-text"   # fast, good quality, free via Ollama
-
-    # LLM
-    LLM_MODEL: str = "claude-sonnet-4-5"
+    EMBED_MODEL: str = "nomic-embed-text"   # embeddings model
+    LLM_MODEL: str = "qwen2.5:3b"          # fast local model (swap for 7b if you want quality)
 
     # ChromaDB
     CHROMA_PERSIST_DIR: Path = Path("data/processed")

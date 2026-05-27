@@ -2,112 +2,88 @@
 Query Agent
 -----------
 Takes a user question, retrieves the most relevant chunks from ChromaDB,
-and uses Claude to synthesize a grounded answer with citations.
+and uses the LLM to synthesize a grounded answer with citations.
 
-This is a ReAct agent: it Reasons and Acts in a loop until it has
-enough information to answer confidently.
+Uses LlamaIndex's query engine with chat memory for follow-up questions.
 """
 
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.core.agent import ReActAgent
-from llama_index.llms.anthropic import Anthropic
+from llama_index.core.chat_engine import CondensePlusContextChatEngine
+from llama_index.llms.ollama import Ollama
 
 from app.config import settings
 from app.ingestion.pipeline import get_vector_store, get_embed_model
 
 
-def build_agent(session_id: str = "default") -> ReActAgent:
+def build_chat_engine(session_id: str = "default") -> CondensePlusContextChatEngine:
     """
-    Builds a ReAct agent wired to the knowledge base.
+    Builds a chat engine wired to the knowledge base.
+
+    CondensePlusContextChatEngine:
+    - Condenses the conversation history into a single query
+    - Retrieves relevant chunks from ChromaDB
+    - Generates a grounded answer with the LLM
 
     Args:
         session_id: used to separate conversation histories
-                    (different users = different sessions)
 
     Returns:
-        A ready-to-use agent that can answer questions
+        A ready-to-use chat engine
     """
-    # Reconnect to existing ChromaDB collection (already ingested)
     _, vector_store = get_vector_store()
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     embed_model = get_embed_model()
 
-    # Load the index from the existing vector store (don't re-embed!)
+    # Load existing index from the vector store (don't re-embed)
     index = VectorStoreIndex.from_vector_store(
         vector_store,
         embed_model=embed_model,
-        storage_context=storage_context,
     )
 
-    # Query engine: handles retrieval + response synthesis
-    # similarity_top_k=5 → fetch the 5 most relevant chunks
-    # response_mode="compact" → concise answers with citations
-    query_engine = index.as_query_engine(
-        llm=Anthropic(
-            model=settings.LLM_MODEL,
-            api_key=settings.ANTHROPIC_API_KEY,
-        ),
-        similarity_top_k=5,
-        response_mode="compact",
+    llm = Ollama(
+        model=settings.LLM_MODEL,
+        base_url=settings.OLLAMA_BASE_URL,
+        request_timeout=300.0,   # 5 min — needed for multi-chunk synthesis
     )
 
-    # Wrap query engine as a tool the agent can call
-    # The description tells the agent WHEN to use this tool
-    knowledge_tool = QueryEngineTool(
-        query_engine=query_engine,
-        metadata=ToolMetadata(
-            name="knowledge_base",
-            description=(
-                "Use this tool to search the knowledge base and answer questions "
-                "about the ingested documents. Always use this tool before answering "
-                "to ensure your response is grounded in the actual documents."
-            ),
-        ),
-    )
+    # Retriever: fetch top-3 most relevant chunks (fewer = faster synthesis)
+    retriever = index.as_retriever(similarity_top_k=3)
 
-    # Memory: keeps conversation history so follow-up questions work
-    # token_limit=4096: keeps the last ~4k tokens of context
+    # Memory: keeps the last 4096 tokens of conversation history
+    # This enables follow-up questions ("what about the second point?")
     memory = ChatMemoryBuffer.from_defaults(token_limit=4096)
 
-    # Build the ReAct agent
-    # ReAct = Reason + Act: the agent thinks step-by-step before answering
-    agent = ReActAgent.from_tools(
-        tools=[knowledge_tool],
-        llm=Anthropic(
-            model=settings.LLM_MODEL,
-            api_key=settings.ANTHROPIC_API_KEY,
-        ),
+    chat_engine = CondensePlusContextChatEngine.from_defaults(
+        retriever=retriever,
+        llm=llm,
         memory=memory,
-        verbose=True,   # prints reasoning steps to console (useful for debugging)
         system_prompt=(
             "You are a helpful assistant with access to a knowledge base. "
-            "Always search the knowledge base before answering. "
-            "Include source references in your answers (document name and section). "
-            "If the knowledge base doesn't contain relevant information, say so clearly "
-            "instead of making things up."
+            "Answer questions based only on the provided context. "
+            "Always mention which document your answer comes from. "
+            "If the context doesn't contain the answer, say so clearly."
         ),
+        verbose=True,
     )
 
-    return agent
+    return chat_engine
 
 
-# Simple cache: one agent per session_id
-# In production this would be Redis or a proper session store
-_agent_cache: dict[str, ReActAgent] = {}
+# Session cache: one engine per session_id
+_engine_cache: dict[str, CondensePlusContextChatEngine] = {}
 
 
-def get_or_create_agent(session_id: str = "default") -> ReActAgent:
-    """Returns cached agent for session, or builds a new one."""
-    if session_id not in _agent_cache:
-        _agent_cache[session_id] = build_agent(session_id)
-    return _agent_cache[session_id]
+def get_or_create_engine(session_id: str = "default") -> CondensePlusContextChatEngine:
+    """Returns cached engine for session, or builds a new one."""
+    if session_id not in _engine_cache:
+        _engine_cache[session_id] = build_chat_engine(session_id)
+    return _engine_cache[session_id]
 
 
 def query(question: str, session_id: str = "default") -> dict:
     """
-    Main function: answer a question using the knowledge base.
+    Answer a question using the knowledge base.
 
     Args:
         question: the user's question in natural language
@@ -116,12 +92,12 @@ def query(question: str, session_id: str = "default") -> dict:
     Returns:
         dict with answer, sources, and session_id
     """
-    agent = get_or_create_agent(session_id)
-    response = agent.chat(question)
+    engine = get_or_create_engine(session_id)
+    response = engine.chat(question)
 
-    # Extract source documents from the response metadata
+    # Extract source documents
     sources = []
-    if hasattr(response, "source_nodes"):
+    if hasattr(response, "source_nodes") and response.source_nodes:
         for node in response.source_nodes:
             sources.append({
                 "file": node.metadata.get("file_name", "unknown"),
