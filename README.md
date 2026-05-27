@@ -130,13 +130,13 @@ Most AI demos connect a PDF to ChatGPT and call it RAG. This project goes furthe
 ## Status
 
 - [x] Project structure and README
-- [ ] Ingestion pipeline (PDF + Markdown + TXT)
-- [ ] ChromaDB integration
-- [ ] ReAct query agent with citations
-- [ ] FastAPI endpoints
-- [ ] Conversation memory
+- [x] Ingestion pipeline (PDF + Markdown + TXT)
+- [x] ChromaDB integration (persistent local storage)
+- [x] Query agent with citations and source scores
+- [x] FastAPI endpoints (/ingest, /query, /documents, /health)
+- [x] Conversation memory (multi-turn follow-up questions)
 - [ ] RAGAS eval suite
-- [ ] Demo with sample dataset
+- [ ] Demo with sample dataset + screenshots
 
 ---
 
