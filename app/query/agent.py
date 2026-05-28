@@ -16,7 +16,20 @@ from app.config import settings
 from app.ingestion.pipeline import get_vector_store, get_embed_model
 
 
-def build_chat_engine(session_id: str = "default") -> CondensePlusContextChatEngine:
+def get_llm(api_key: str = ""):
+    """Returns the configured LLM — OpenAI if key provided, Ollama otherwise."""
+    key = api_key or settings.OPENAI_API_KEY
+    if key:
+        from llama_index.llms.openai import OpenAI
+        return OpenAI(model=settings.OPENAI_MODEL, api_key=key)
+    return Ollama(
+        model=settings.LLM_MODEL,
+        base_url=settings.OLLAMA_BASE_URL,
+        request_timeout=300.0,
+    )
+
+
+def build_chat_engine(session_id: str = "default", api_key: str = "") -> CondensePlusContextChatEngine:
     """
     Builds a chat engine wired to the knowledge base.
 
@@ -41,14 +54,10 @@ def build_chat_engine(session_id: str = "default") -> CondensePlusContextChatEng
         embed_model=embed_model,
     )
 
-    llm = Ollama(
-        model=settings.LLM_MODEL,
-        base_url=settings.OLLAMA_BASE_URL,
-        request_timeout=300.0,   # 5 min — needed for multi-chunk synthesis
-    )
+    llm = get_llm(api_key)
 
-    # Retriever: fetch top-3 most relevant chunks (fewer = faster synthesis)
-    retriever = index.as_retriever(similarity_top_k=3)
+    # Retriever: fetch top-6 most relevant chunks
+    retriever = index.as_retriever(similarity_top_k=6)
 
     # Memory: keeps the last 4096 tokens of conversation history
     # This enables follow-up questions ("what about the second point?")
@@ -59,10 +68,14 @@ def build_chat_engine(session_id: str = "default") -> CondensePlusContextChatEng
         llm=llm,
         memory=memory,
         system_prompt=(
-            "You are a helpful assistant with access to a knowledge base. "
+            "You are a helpful assistant with access to a personal knowledge base. "
+            "IMPORTANT: Always respond in the same language the user writes in. "
+            "If the user writes in Spanish, respond in Spanish. "
+            "If the user writes in English, respond in English. "
             "Answer questions based only on the provided context. "
-            "Always mention which document your answer comes from. "
-            "If the context doesn't contain the answer, say so clearly."
+            "Always cite which document your answer comes from. "
+            "If the context doesn't contain enough information, say so clearly "
+            "and suggest the user might want to add more documents on that topic."
         ),
         verbose=True,
     )
@@ -74,14 +87,15 @@ def build_chat_engine(session_id: str = "default") -> CondensePlusContextChatEng
 _engine_cache: dict[str, CondensePlusContextChatEngine] = {}
 
 
-def get_or_create_engine(session_id: str = "default") -> CondensePlusContextChatEngine:
+def get_or_create_engine(session_id: str = "default", api_key: str = "") -> CondensePlusContextChatEngine:
     """Returns cached engine for session, or builds a new one."""
-    if session_id not in _engine_cache:
-        _engine_cache[session_id] = build_chat_engine(session_id)
-    return _engine_cache[session_id]
+    cache_key = f"{session_id}:{bool(api_key)}"
+    if cache_key not in _engine_cache:
+        _engine_cache[cache_key] = build_chat_engine(session_id, api_key)
+    return _engine_cache[cache_key]
 
 
-def query(question: str, session_id: str = "default") -> dict:
+def query(question: str, session_id: str = "default", api_key: str = "") -> dict:
     """
     Answer a question using the knowledge base.
 
@@ -92,7 +106,7 @@ def query(question: str, session_id: str = "default") -> dict:
     Returns:
         dict with answer, sources, and session_id
     """
-    engine = get_or_create_engine(session_id)
+    engine = get_or_create_engine(session_id, api_key)
     response = engine.chat(question)
 
     # Extract source documents

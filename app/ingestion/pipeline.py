@@ -18,6 +18,18 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from app.config import settings
 
+# Path to the user config (same file saved by the UI)
+_USER_CONFIG = settings.CHROMA_PERSIST_DIR / ".user_config.json"
+
+def _get_openai_key() -> str:
+    """Read OpenAI key from user config file."""
+    if _USER_CONFIG.exists():
+        try:
+            return json.loads(_USER_CONFIG.read_text(encoding="utf-8")).get("openai_api_key", "")
+        except Exception:
+            pass
+    return settings.OPENAI_API_KEY
+
 
 # ── Vector store ──────────────────────────────────────────────────────────────
 
@@ -30,6 +42,18 @@ def get_vector_store(collection_name: Optional[str] = None):
 
 
 def get_embed_model():
+    """
+    Returns the best available embed model.
+    - If OpenAI key is configured → text-embedding-3-small (much better for Spanish)
+    - Otherwise → nomic-embed-text via Ollama (local fallback)
+    """
+    key = _get_openai_key()
+    if key:
+        from llama_index.embeddings.openai import OpenAIEmbedding
+        return OpenAIEmbedding(
+            model=settings.OPENAI_EMBED_MODEL,
+            api_key=key,
+        )
     return OllamaEmbedding(
         model_name=settings.EMBED_MODEL,
         base_url=settings.OLLAMA_BASE_URL,

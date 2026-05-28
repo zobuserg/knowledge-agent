@@ -8,10 +8,20 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # LLM provider: "openai" or "ollama"
+    LLM_PROVIDER: str = "ollama"
+
+    # OpenAI (cloud, fast, best quality)
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"       # fast + cheap + smart
+
     # Ollama (local, free, no API key needed)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    EMBED_MODEL: str = "nomic-embed-text"   # embeddings model
-    LLM_MODEL: str = "qwen2.5:3b"          # fast local model (swap for 7b if you want quality)
+    EMBED_MODEL: str = "nomic-embed-text"   # fallback when no OpenAI key
+    LLM_MODEL: str = "qwen2.5:3b"          # fallback if no API key
+
+    # OpenAI embeddings (much better for Spanish/multilingual)
+    OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
 
     # ChromaDB
     CHROMA_PERSIST_DIR: Path = Path("data/processed")

@@ -4,7 +4,9 @@ Run: streamlit run ui.py
 """
 
 import sys
+import json
 import tempfile
+import threading
 from pathlib import Path
 import streamlit as st
 
@@ -41,12 +43,48 @@ st.markdown("""
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
+USER_CONFIG = Path("data/processed/.user_config.json")
+
+def load_user_config() -> dict:
+    if USER_CONFIG.exists():
+        try:
+            return json.loads(USER_CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def save_user_config(data: dict):
+    USER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    USER_CONFIG.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "session_id" not in st.session_state:
     st.session_state.session_id = "default"
 if "last_stats" not in st.session_state:
     st.session_state.last_stats = None
+if "picked_folder" not in st.session_state:
+    st.session_state.picked_folder = ""
+if "api_key" not in st.session_state:
+    st.session_state.api_key = load_user_config().get("openai_api_key", "")
+
+
+def open_folder_picker():
+    """Opens a native OS folder dialog and stores the result in session state."""
+    import tkinter as tk
+    from tkinter import filedialog
+    result = {"path": ""}
+    def _pick():
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", 1)
+        folder = filedialog.askdirectory(title="Select your knowledge folder")
+        root.destroy()
+        result["path"] = folder
+    t = threading.Thread(target=_pick)
+    t.start()
+    t.join()
+    return result["path"]
 
 
 def refresh_stats():
@@ -99,26 +137,33 @@ with st.sidebar:
                 st.rerun()
             st.divider()
 
-        folder_path = st.text_input(
-            "Connect a folder",
-            placeholder="C:/Users/you/Documents  or  D:/vault",
-            help="Paste the path to any folder on your computer",
-        )
+        # Folder picker button
+        if st.button("📂 Choose folder...", use_container_width=True):
+            picked = open_folder_picker()
+            if picked:
+                st.session_state.picked_folder = picked
+
+        folder_path = st.session_state.picked_folder
+        if folder_path:
+            st.caption(f"📁 `{Path(folder_path).name}`")
+            st.caption(f"`{folder_path}`")
+
         recursive = st.checkbox("Include subfolders", value=True)
 
         if st.button("Connect & sync", use_container_width=True,
-                     disabled=not folder_path.strip()):
+                     type="primary", disabled=not folder_path):
             with st.spinner("Indexing folder..."):
                 try:
-                    result = sync_folder(folder_path.strip(), recursive=recursive)
+                    result = sync_folder(folder_path, recursive=recursive)
                     _engine_cache.clear()
+                    st.session_state.picked_folder = ""
                     st.success(
                         f"✅ Done — {result['new']} files indexed"
                         + (f", {result['skipped']} unchanged" if result['skipped'] else "")
                     )
                     st.rerun()
                 except FileNotFoundError:
-                    st.error("Folder not found. Check the path and try again.")
+                    st.error("Folder not found.")
                 except Exception as e:
                     st.error(f"Error: {e}")
 
@@ -157,6 +202,36 @@ with st.sidebar:
             if stats['total_documents'] > 50:
                 st.caption(f"... and {stats['total_documents'] - 50} more")
 
+    # ── LLM Settings ─────────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("⚙️ LLM Settings", expanded=not st.session_state.api_key):
+        api_key = st.text_input(
+            "OpenAI API Key",
+            value=st.session_state.api_key,
+            type="password",
+            placeholder="sk-... (leave empty to use local Ollama)",
+            help="Paste your OpenAI API key once — it's saved automatically.",
+        )
+        if api_key != st.session_state.api_key:
+            st.session_state.api_key = api_key
+            cfg = load_user_config()
+            cfg["openai_api_key"] = api_key
+            save_user_config(cfg)
+            _engine_cache.clear()
+            st.rerun()
+
+        if st.session_state.api_key:
+            st.caption("✅ Using OpenAI gpt-4o-mini")
+            if st.button("🗑️ Remove key", use_container_width=True):
+                st.session_state.api_key = ""
+                cfg = load_user_config()
+                cfg["openai_api_key"] = ""
+                save_user_config(cfg)
+                _engine_cache.clear()
+                st.rerun()
+        else:
+            st.caption("🖥️ Using local Ollama (slower)")
+
     st.divider()
     if st.button("🗑️ Clear session", use_container_width=True):
         st.session_state.messages = []
@@ -164,7 +239,10 @@ with st.sidebar:
         _engine_cache.clear()
         st.rerun()
 
-    st.caption("Runs 100% locally · Powered by Ollama")
+    if st.session_state.get("api_key"):
+        st.caption("Powered by OpenAI · Embeddings local")
+    else:
+        st.caption("Runs 100% locally · Powered by Ollama")
 
 
 # ── Main: onboarding or chat ──────────────────────────────────────────────────
@@ -183,7 +261,7 @@ if not has_docs:
         <div class="setup-card">
             <h3>📁 Connect a folder</h3>
             <p>Have an existing knowledge base? Obsidian vault, documents folder, project notes?</p>
-            <p>Paste the folder path in the sidebar → <b>Connect & sync</b></p>
+            <p>Click <b>Choose folder…</b> in the sidebar, select your folder, then hit <b>Connect & sync</b></p>
             <p style="color:#888; font-size:0.85rem;">All files stay where they are. Nothing gets moved.</p>
         </div>
         """, unsafe_allow_html=True)
@@ -238,7 +316,11 @@ else:
         with st.chat_message("assistant"):
             with st.spinner("Searching..."):
                 try:
-                    result = query(question, session_id=st.session_state.session_id)
+                    result = query(
+                        question,
+                        session_id=st.session_state.session_id,
+                        api_key=st.session_state.get("api_key", ""),
+                    )
                     answer = result["answer"]
                     sources = result["sources"]
 
