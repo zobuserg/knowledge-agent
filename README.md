@@ -1,143 +1,107 @@
 # Knowledge Agent
 
-An agentic RAG (Retrieval-Augmented Generation) system that ingests your documents and lets you query them with an AI agent that reasons over the content and returns answers with citations.
+**Semantic memory for your documents.** A local RAG system with a real ReAct agent on top:
+point it at a folder (an Obsidian vault, a library of PDFs, your notes), and ask questions in
+natural language — the agent decides how many searches to run, answers grounded in your files,
+and cites its sources. Conversations persist across restarts.
 
-Built as a portfolio project demonstrating production-grade AI engineering skills: document ingestion pipelines, vector search, agentic reasoning, REST API, and automated evaluation.
+Works standalone — or as the **Tier-3 knowledge upgrade** for
+[Expert Agent](https://github.com/dantedanielgm/expert-agent): when your knowledge folder outgrows
+plain-text search, this is the semantic layer you plug in.
 
 ---
 
 ## What it does
 
-- **Ingest** PDF, Markdown, and plain text documents into a persistent vector store
-- **Query** your knowledge base in natural language — the agent retrieves the most relevant chunks and synthesizes a grounded answer
-- **Cite sources** — every answer includes the source document and page/section reference
-- **Evaluate** — built-in eval suite using RAGAS to measure faithfulness, answer relevance, and context precision
-- **REST API** — FastAPI backend, ready to integrate with any frontend or workflow
+- **Folder sync, incremental.** Connect a folder; only new or changed files get re-indexed
+  (MD5-hash tracking). Re-sync 500 files where 3 changed → 3 get embedded.
+- **Agentic retrieval.** A ReAct agent with a `search_knowledge_base` tool decides — per
+  question — how many retrieval calls to make and with which queries, instead of one fixed
+  top-k lookup. Multi-part questions trigger multiple searches.
+- **Answers with citations.** Every answer lists the source files (with relevance scores and
+  excerpts) that every retrieval step touched.
+- **Persistent sessions.** Chat history is saved to disk per session and survives restarts.
+- **Multilingual.** Ask in Spanish about English documents (or vice versa) — embeddings are
+  multilingual and the agent replies in your language.
+- **Evals included.** A runnable eval suite measures retrieval hit-rate and end-to-end answer
+  quality against *your* corpus — so config changes are judged by a score, not a feeling.
 
----
+## Stack (what actually runs)
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      FastAPI Server                      │
-│   POST /ingest   ·   POST /query   ·   GET /documents   │
-└────────────────────────┬────────────────────────────────┘
-                         │
-          ┌──────────────┴──────────────┐
-          │                             │
-   ┌──────▼──────┐              ┌───────▼──────┐
-   │  Ingestion  │              │  Query Agent │
-   │  Pipeline   │              │              │
-   │             │              │  LlamaIndex  │
-   │  • Chunking │              │  ReAct Agent │
-   │  • Embed    │              │  + Memory    │
-   │  • Store    │              └───────┬──────┘
-   └──────┬──────┘                      │
-          │                             │
-   ┌──────▼─────────────────────────────▼──────┐
-   │              ChromaDB (vector store)       │
-   │         persistent · local · fast          │
-   └────────────────────────────────────────────┘
-```
-
----
-
-## Tech stack
-
-| Layer | Technology |
+| Layer | Tech |
 |---|---|
-| Agent framework | LlamaIndex |
-| Vector store | ChromaDB |
-| LLM | Anthropic Claude (claude-sonnet-4-5) |
-| Embeddings | sentence-transformers / nomic-embed |
-| API | FastAPI + uvicorn |
-| Evaluation | RAGAS |
-| Language | Python 3.12 |
+| UI | **Streamlit** (`ui.py`) — folder picker, multi-file upload, chat |
+| API | **FastAPI** (`main.py`) — `/ingest`, `/query`, `/documents`, `/health` |
+| Agent | **LlamaIndex ReActAgent** + `QueryEngineTool` |
+| LLM | **OpenAI** `gpt-4o-mini` (with key) · **Ollama** `qwen2.5:3b` (local fallback) |
+| Embeddings | OpenAI `text-embedding-3-small` (with key) · `nomic-embed-text` via Ollama |
+| Vector store | **ChromaDB**, persistent on disk |
 
----
-
-## Project structure
-
-```
-knowledge-agent/
-├── app/
-│   ├── ingestion/       # Document loading, chunking, embedding
-│   ├── query/           # Agent logic, retrieval, answer generation
-│   └── memory/          # Conversation history persistence
-├── data/
-│   ├── raw/             # Drop your documents here
-│   └── processed/       # ChromaDB persistent storage
-├── evals/               # RAGAS evaluation suite + test dataset
-├── scripts/             # CLI utilities (ingest, query, eval)
-├── main.py              # FastAPI app entry point
-├── requirements.txt
-└── .env.example
-```
-
----
+No key? Everything falls back to local Ollama — free, private, slower.
 
 ## Quickstart
 
 ```bash
-# 1. Clone and install
-git clone https://github.com/zobuserg/knowledge-agent.git
+git clone https://github.com/dantedanielgm/knowledge-agent.git
 cd knowledge-agent
+python -m venv .venv && .venv/Scripts/activate   # Windows (use bin/activate on Mac/Linux)
 pip install -r requirements.txt
 
-# 2. Set your API key
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
+cp .env.example .env        # add your OPENAI_API_KEY (or leave empty for Ollama)
 
-# 3. Ingest documents
-python scripts/ingest.py --path data/raw/
+# Option A — the app (recommended)
+streamlit run ui.py         # connect a folder from the UI and start asking
 
-# 4. Run the API
-uvicorn main:app --reload
-
-# 5. Query
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{"question": "What are the main topics covered?"}'
+# Option B — CLI + API
+python scripts/ingest.py --path path/to/your/docs
+uvicorn main:app --reload   # then POST /query
 ```
 
----
-
-## Evaluation
+## Evals — measure it, don't feel it
 
 ```bash
-python evals/run_evals.py
+python evals/run_evals.py          # retrieval hit-rate (cheap: embeddings only)
+python evals/run_evals.py --e2e    # + full agent answers graded (LLM cost)
 ```
 
-Runs the RAGAS evaluation suite and reports:
-- **Faithfulness** — is the answer grounded in the retrieved context?
-- **Answer Relevance** — does the answer actually address the question?
-- **Context Precision** — are the retrieved chunks relevant?
+Copy `evals/dataset.example.json` → `evals/dataset.json` and write cases that match **your**
+documents: a question, the file that should be retrieved, facts the answer must state. Every time
+you change the embedding model, chunk size or top-k, the score tells you whether it helped.
+(The personal dataset is gitignored — commit the example, keep your cases yours.)
+
+## Architecture
+
+```
+        ┌────────────┐        ┌──────────────┐
+docs →  │ ingestion  │  → →   │  ChromaDB    │
+        │ (hash sync)│        │ (persistent) │
+        └────────────┘        └──────┬───────┘
+                                     │ search_knowledge_base (tool)
+                              ┌──────┴───────┐
+ question → Streamlit/API  →  │  ReAct agent │ → answer + citations
+                              │ (N searches, │
+                              │  it decides) │ ←→ sessions/ (persistent memory)
+                              └──────────────┘
+```
+
+## Part of an ecosystem
+
+This repo is the knowledge layer of a two-piece system:
+
+- **[expert-agent](https://github.com/dantedanielgm/expert-agent)** — the brain: a personal expert
+  agent for Claude Code (engineer + verifier + AI operator + tutor, specialty of your choice). Its
+  knowledge protocol starts with plain-text search over your folder — the right default.
+- **knowledge-agent** (this repo) — the semantic memory: when the corpus grows past what keyword
+  search handles (whole books, cross-language questions, paraphrase misses), this is the upgrade.
+
+## Honest status
+
+- ✅ Ingestion with incremental sync — in daily use over a 500+ file vault (6,900+ chunks)
+- ✅ ReAct agent with decision-driven retrieval, persistent sessions, citations
+- ✅ Eval suite (retrieval + e2e) runnable against your own corpus
+- 🔜 Retrieval re-ranking; RAGAS-style graded metrics on top of the eval suite
 
 ---
 
-## Why this project
-
-Most AI demos connect a PDF to ChatGPT and call it RAG. This project goes further:
-
-1. **Agentic retrieval** — the agent decides *how many* retrieval steps to take before answering, not a fixed k-chunk lookup
-2. **Persistent memory** — conversation history survives across sessions
-3. **Eval-driven** — every change is validated against a test dataset before shipping
-4. **Production-ready structure** — FastAPI, environment config, proper error handling
-
----
-
-## Status
-
-- [x] Project structure and README
-- [x] Ingestion pipeline (PDF + Markdown + TXT)
-- [x] ChromaDB integration (persistent local storage)
-- [x] Query agent with citations and source scores
-- [x] FastAPI endpoints (/ingest, /query, /documents, /health)
-- [x] Conversation memory (multi-turn follow-up questions)
-- [ ] RAGAS eval suite
-- [ ] Demo with sample dataset + screenshots
-
----
-
-*Built by [@zobuserg](https://github.com/zobuserg)*
+Built by **Dante Daniel Gutiérrez Matos** ([@dantedanielgm](https://github.com/dantedanielgm)) ·
+MIT License

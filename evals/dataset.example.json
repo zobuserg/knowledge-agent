@@ -1,0 +1,12 @@
+[
+  {
+    "question": "What is this document collection about?",
+    "expect_file": ".md",
+    "must_contain": []
+  },
+  {
+    "question": "REPLACE ME: a question whose answer lives in one of YOUR documents",
+    "expect_file": "REPLACE ME: part of the file name that should be retrieved",
+    "must_contain": ["REPLACE ME: a fact the answer must state"]
+  }
+]

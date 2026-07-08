@@ -19,6 +19,17 @@ build/
 # Vector store data (too large for git)
 data/processed/
 
+# User documents (personal — never commit)
+data/raw/*
+!data/raw/.gitkeep
+
+# Personal eval dataset (commit only the example)
+evals/dataset.json
+
+# Logs & scratch
+*.log
+reindex_*.txt
+
 # OS
 .DS_Store
 Thumbs.db
